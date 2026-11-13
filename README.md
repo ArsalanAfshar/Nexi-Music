@@ -28,7 +28,7 @@ Open this repository in Android Studio for an emulator or device install. Grant 
 
 ## Install a release APK
 
-GitHub Releases provide one **universal** APK and smaller architecture-specific APKs when a signed release has been published:
+GitHub Releases provide one **universal** APK and smaller architecture-specific APKs. v0.1.0 is a **pre-release test build**, signed with an intentionally public test key. Its keystore and credentials are attached publicly to that release; do not use them for production. A later private signing key will not update these installs—uninstall the test build before switching keys.
 
 - `Nexi-Music-<version>-universal.apk` — choose this if unsure; works across supported ABIs.
 - `Nexi-Music-<version>-arm64-v8a.apk` — most current Android phones/tablets.
@@ -39,12 +39,7 @@ Check **Settings → About phone → Android version / device specifications** o
 
 ## Release maintainers
 
-Tag a version (`v0.1.0`, for example) to run `.github/workflows/release.yml`. Before the first release, add repository Actions secrets:
-
-- `ANDROID_KEYSTORE_BASE64`: base64-encoded release keystore (`base64 -w0 release.jks` on Linux).
-- `ANDROID_KEY_ALIAS`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`.
-
-Keep the keystore and passwords offline/backed up. **Never commit them.** The workflow fails if signing credentials are missing; unsigned APKs are not published. The signing key must be retained permanently for upgrade compatibility.
+Tag a version (`v0.1.0`, for example) to run `.github/workflows/release.yml`. The first test release generates a temporary JKS signing identity in GitHub Actions and publishes the keystore and credentials alongside the APKs. Those test credentials are deliberately public; anyone can sign as that identity. Do not reuse them for production. Replace this test setup with a securely controlled, persistent private key before publishing production builds. Keep one production signing key permanently for upgrade compatibility.
 
 ## Preset format
 
