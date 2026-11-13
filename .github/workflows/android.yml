@@ -32,7 +32,7 @@ jobs:
           result=$?
           if [ "$result" -ne 0 ]; then
             echo 'Gradle diagnostic summary:'
-            grep -E '(^e: |error:|What went wrong:|Execution failed for task|Could not |Caused by:|FAILURE:|Unresolved reference|Type mismatch|Overload resolution ambiguity|Expecting )' build-output.log | tail -n 80 || true
+            while IFS= read -r line; do echo "::error title=Gradle diagnostic::$line"; done < <(grep -Ei '(^e: |error:|What went wrong:|Execution failed for task|Could not |Caused by:|FAILURE:|Unresolved reference|Type mismatch|Overload resolution ambiguity|Expecting |failed|exception|denied|timed out)' build-output.log | tail -n 80)
             echo 'Gradle output tail:'
             tail -n 20 build-output.log
           else
