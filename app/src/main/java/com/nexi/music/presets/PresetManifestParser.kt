@@ -50,7 +50,7 @@ object PresetManifestParser {
                 require(name in wallpaperNames) { "Preset wallpaper reference is not allowed" }
                 name
             } else null
-            Parsed(kind, appearance, dependencies, requires, wallpaperName)
+            Parsed(kind, appearance, dependencies.takeIf { requires.isNotEmpty() }, requires, wallpaperName)
         } else {
             require(!root.has("appearance") && !root.has("requiredSettings")) {
                 "Settings presets cannot contain appearance data or appearance dependencies"

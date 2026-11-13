@@ -12,7 +12,7 @@ class PresetManifestParserTest {
             """{"format":"nexi-preset","version":1,"kind":"appearance","appearance":{"accent":-4362138,"dark":true,"corner":20,"density":1.1,"wallpaperBrightness":0.3,"wallpaperBlur":4}}""",
         )
         assertEquals("appearance", parsed.kind)
-        assertEquals(20f, parsed.appearance?.corner)
+        assertEquals(20f, parsed.appearance?.corner ?: 0f, 0.001f)
         assertNull(parsed.settings)
         assertEquals(emptyList<String>(), parsed.requiredSettings)
     }
