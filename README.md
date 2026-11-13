@@ -40,7 +40,7 @@ Check **Settings → About phone → Android version / device specifications** o
 
 ## Release maintainers
 
-Tag a version (`v0.2.0`, for example) to run `.github/workflows/release.yml`. v0.1.0 established the intentionally public test signing identity; later test releases reuse that same keystore from the v0.1.0 release backup and attach a copy with credentials to each release. Those credentials are public; anyone can sign as that identity. Do not reuse them for production. Replace this test setup with a securely controlled, persistent private key before publishing production builds. Keep one production signing key permanently for upgrade compatibility.
+Tag a version (`v0.2.0`, for example) to run `.github/workflows/release.yml`. The exact v0.1.0 test keystore is committed at `signing/Nexi-Music-TEST-KEYSTORE.jks`, intentionally public and reused across releases; the workflow verifies existing release backups match it and attaches a copy with credentials to each pre-release. Anyone can sign as that identity. Do not reuse it for production. Replace this test setup with a securely controlled, persistent private key before publishing production builds. Keep one production signing key permanently for upgrade compatibility.
 
 ## Preset format
 

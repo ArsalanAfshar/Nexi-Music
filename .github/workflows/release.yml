@@ -35,23 +35,17 @@ jobs:
           alias='nexi-public-test'
           password='NexiMusicTest2026'
 
-          # Reuse the key already published with a prior attempt so a workflow rerun
-          # cannot silently replace the certificate on an existing release.
+          # The public test identity is committed in the repository and is also backed
+          # up on each pre-release. Never silently rotate this key: existing installs
+          # must remain updateable, even when a tagged workflow is rerun.
+          repository_key="$GITHUB_WORKSPACE/signing/Nexi-Music-TEST-KEYSTORE.jks"
+          test -s "$repository_key" || { echo 'Committed public test keystore is missing.' >&2; exit 1; }
           if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
             gh release download "$VERSION_TAG" --pattern "$(basename "$keystore")" --dir "$key_dir"
             test -s "$keystore" || { echo 'Existing release is missing its signing-key backup; refusing to rotate it.' >&2; exit 1; }
-          elif [ "$version" != '0.1.0' ]; then
-            # v0.1.0 is the permanent public test-key anchor for subsequent test releases.
-            anchor="$key_dir/Nexi-Music-0.1.0-TEST-KEYSTORE.jks"
-            gh release download v0.1.0 --pattern 'Nexi-Music-0.1.0-TEST-KEYSTORE.jks' --dir "$key_dir"
-            test -s "$anchor" || { echo 'The v0.1.0 test keystore is unavailable; refusing to sign with a different key.' >&2; exit 1; }
-            cp "$anchor" "$keystore"
+            cmp -s "$repository_key" "$keystore" || { echo 'Existing release key does not match the committed test key; refusing to sign.' >&2; exit 1; }
           else
-            keytool -genkeypair -noprompt \
-              -keystore "$keystore" -storetype JKS \
-              -storepass "$password" -keypass "$password" \
-              -alias "$alias" -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname 'CN=Nexi Music Public Test Key, O=Nexi Music, C=US'
+            cp "$repository_key" "$keystore"
           fi
 
           echo "ANDROID_KEYSTORE_FILE=$keystore" >> "$GITHUB_ENV"

@@ -7,7 +7,7 @@
 - Validate preset schema, types, ranges, dependencies, ZIP paths, duplicate entries, sizes and bundled image data before any settings are committed.
 - Save preset changes transactionally, preserve unrelated settings, and process wallpapers through bounded image decoding and atomic app-private files.
 - Add a bounded local crash log and in-app viewer/copy/clear controls, plus JVM tests for preset validation and log bounds.
-- Keep the public test signing identity stable across tagged pre-releases; label test key material and update compatibility warnings.
+- Commit the exact v0.1.0 public test keystore in `signing/`, reuse it across tagged pre-releases, and verify release backups match it; label test key material and update compatibility warnings.
 
 **Test-key notice:** this is a pre-release test build signed with the intentionally public v0.1.0 key. Replacing it with a private production key will require uninstalling these test builds first.
 

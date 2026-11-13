@@ -18,6 +18,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Validate the committed public test keystore
+        run: keytool -list -keystore signing/Nexi-Music-TEST-KEYSTORE.jks -storetype JKS -storepass NexiMusicTest2026 -alias nexi-public-test
       - uses: android-actions/setup-android@v4
       - uses: gradle/actions/setup-gradle@v6
         with:

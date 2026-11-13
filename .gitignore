@@ -7,5 +7,6 @@ local.properties
 *.aab
 *.jks
 *.keystore
+!signing/Nexi-Music-TEST-KEYSTORE.jks
 release-assets/
 .DS_Store
