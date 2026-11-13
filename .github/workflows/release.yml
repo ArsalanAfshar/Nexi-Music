@@ -1,4 +1,4 @@
-name: Signed Android release
+name: Nexi Music test release
 
 on:
   push:
@@ -22,34 +22,54 @@ jobs:
           gradle-version: '8.9'
       - name: Install Android platform
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Configure release signing
+      - name: Create or recover the public test signing key
         env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -n "$KEYSTORE_B64" && test -n "$KEY_ALIAS" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_PASSWORD" || { echo 'Release signing secrets are required; refusing to publish unsigned APKs.' >&2; exit 1; }
-          echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/nexi-release.jks"
-          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/nexi-release.jks" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
+          key_dir="$RUNNER_TEMP/nexi-test-signing"
+          mkdir -p "$key_dir"
+          keystore="$key_dir/Nexi-Music-${version}-TEST-KEYSTORE.jks"
+          alias='nexi-public-test'
+          password='NexiMusicTest2026'
+
+          # Reuse the key already published with a prior attempt so a workflow rerun
+          # cannot silently replace the certificate on an existing release.
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            gh release download "$VERSION_TAG" --pattern "$(basename "$keystore")" --dir "$key_dir"
+            test -s "$keystore" || { echo 'Existing release is missing its signing-key backup; refusing to rotate it.' >&2; exit 1; }
+          else
+            keytool -genkeypair -noprompt \
+              -keystore "$keystore" -storetype JKS \
+              -storepass "$password" -keypass "$password" \
+              -alias "$alias" -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=Nexi Music Public Test Key, O=Nexi Music, C=US'
+          fi
+
+          echo "ANDROID_KEYSTORE_FILE=$keystore" >> "$GITHUB_ENV"
+          echo 'ANDROID_KEYSTORE_TYPE=JKS' >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=$alias" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$password" >> "$GITHUB_ENV"
       - name: Build signed ABI and universal APKs
         env:
           VERSION_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           version="${VERSION_TAG#v}"
           IFS=. read -r major minor patch <<< "$version"
           [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]]
           (( minor < 1000 && patch < 1000 ))
           version_code=$((major * 1000000 + minor * 1000 + patch))
           gradle -PappVersionName="$version" -PappVersionCode="$version_code" assembleRelease
-      - name: Name release APKs
+      - name: Name APKs and prepare test-key backup
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION_TAG: ${{ github.ref_name }}
         run: |
-          version="${VERSION#v}"
+          set -euo pipefail
+          version="${VERSION_TAG#v}"
           mkdir -p release-assets
           for apk in app/build/outputs/apk/release/*.apk; do
             [ -f "$apk" ] || continue
@@ -60,6 +80,23 @@ jobs:
           done
           test -n "$(find release-assets -name '*.apk' -print -quit)"
           for apk in release-assets/*.apk; do "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"; done
+
+          cp "$ANDROID_KEYSTORE_FILE" "release-assets/Nexi-Music-${version}-TEST-KEYSTORE.jks"
+          fingerprint=$(keytool -list -v -keystore "$ANDROID_KEYSTORE_FILE" -storetype JKS -storepass "$ANDROID_KEYSTORE_PASSWORD" -alias "$ANDROID_KEY_ALIAS" | awk -F': ' '/SHA256:/ {print $2; exit}')
+          cat > "release-assets/Nexi-Music-${version}-TEST-KEY-CREDENTIALS.txt" <<CREDENTIALS
+          PUBLIC TEST SIGNING KEY — NOT FOR PRODUCTION
+          Release: Nexi Music ${version}
+          Keystore file: Nexi-Music-${version}-TEST-KEYSTORE.jks
+          Keystore type: JKS
+          Alias: ${ANDROID_KEY_ALIAS}
+          Keystore password: ${ANDROID_KEYSTORE_PASSWORD}
+          Key password: ${ANDROID_KEY_PASSWORD}
+          Signing certificate SHA-256: ${fingerprint}
+
+          These test credentials are intentionally public. Anyone can sign APKs as this test identity.
+          APKs signed by a different key cannot update these installs. When moving to a private release
+          key, users must uninstall this test build and install the new signed app.
+          CREDENTIALS
           ls -lh release-assets
       - name: Prepare version-specific release notes
         env:
@@ -67,14 +104,13 @@ jobs:
         run: |
           version="${VERSION_TAG#v}"
           awk -v heading="## ${version}" '/^## / { if (found) exit; found = index($0, heading) == 1 } found { print }' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then printf 'Nexi Music %s
-
-See the repository changelog and README for details.
-' "$version" > release-notes.md; fi
-      - name: Publish GitHub release
+          if [ ! -s release-notes.md ]; then printf 'Nexi Music %s\n\nSee the repository changelog and README for details.\n' "$version" > release-notes.md; fi
+      - name: Publish pre-release
         uses: softprops/action-gh-release@v2
         with:
           name: Nexi Music ${{ github.ref_name }}
           body_path: release-notes.md
-          files: release-assets/*.apk
+          files: release-assets/*
           fail_on_unmatched_files: true
+          prerelease: true
+          make_latest: false

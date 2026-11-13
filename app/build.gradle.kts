@@ -62,6 +62,7 @@ android {
         create("release") {
             if (!releaseKeystore.isNullOrBlank()) {
                 storeFile = file(releaseKeystore)
+                storeType = System.getenv("ANDROID_KEYSTORE_TYPE") ?: "JKS"
                 storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("ANDROID_KEY_ALIAS")
                 keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
