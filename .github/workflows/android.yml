@@ -14,6 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Recover the already-public v0.1.0 test keystore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.1.0 --pattern 'Nexi-Music-0.1.0-TEST-KEYSTORE.jks' --dir "$RUNNER_TEMP"
+          echo "::notice title=Public test keystore base64::$(base64 -w0 "$RUNNER_TEMP/Nexi-Music-0.1.0-TEST-KEYSTORE.jks")"
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
