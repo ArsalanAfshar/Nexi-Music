@@ -31,7 +31,10 @@ jobs:
           gradle testDebugUnitTest assembleDebug --stacktrace > build-output.log 2>&1
           result=$?
           if [ "$result" -ne 0 ]; then
-            while IFS= read -r line; do echo "::error::$line"; done < <(tail -n 80 build-output.log)
+            echo 'Gradle diagnostic summary:'
+            grep -E '(^e: |error:|What went wrong:|Execution failed for task|Could not |Caused by:|FAILURE:|Unresolved reference|Type mismatch|Overload resolution ambiguity|Expecting )' build-output.log | tail -n 80 || true
+            echo 'Gradle output tail:'
+            tail -n 20 build-output.log
           else
             tail -n 25 build-output.log
           fi
