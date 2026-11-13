@@ -57,6 +57,10 @@ import com.nexi.music.data.Track
 import com.nexi.music.data.WallpaperStore
 import com.nexi.music.diagnostics.CrashLogStore
 import com.nexi.music.playback.MusicPlaybackService
+import com.nexi.music.playback.PlaylistStore
+import com.nexi.music.playback.SavedPlaylist
+import com.nexi.music.playback.PlayerScreen
+import com.nexi.music.playback.QueueOperations
 import com.nexi.music.presets.PresetArchive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -102,6 +106,20 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
     var isScanning by remember { mutableStateOf(false) }
     var libraryMessage by remember { mutableStateOf<String?>(null) }
     var playbackError by remember { mutableStateOf<String?>(null) }
+    val playlistStore = remember { PlaylistStore(activity) }
+    var playlists by remember { mutableStateOf(runCatching { playlistStore.all() }.getOrDefault(emptyList())) }
+    var queueTracks by remember { mutableStateOf(emptyList<Track>()) }
+    var playerPosition by remember { mutableLongStateOf(0L) }
+    var repeatMode by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
+    var shuffleEnabled by remember { mutableStateOf(false) }
+    var playbackSpeed by remember { mutableFloatStateOf(prefs.getFloat("playbackSpeed", 1f).takeIf { it.isFinite() && it in .5f..2f } ?: 1f) }
+    var playbackPitch by remember { mutableFloatStateOf(prefs.getFloat("playbackPitch", 1f).takeIf { it.isFinite() && it in .5f..2f } ?: 1f) }
+    var sleepTimerMinutes by remember { mutableIntStateOf(0) }
+    var currentBookmark by remember { mutableStateOf<Long?>(null) }
+    var showPlaylistDialog by remember { mutableStateOf(false) }
+    var saveQueueInDialog by remember { mutableStateOf(false) }
+    var playlistName by remember { mutableStateOf("") }
+    var collectionMessage by remember { mutableStateOf<String?>(null) }
     var importError by remember { mutableStateOf<String?>(null) }
     var importCandidate by remember { mutableStateOf<PresetArchive.Imported?>(null) }
     var showDependencyApproval by remember { mutableStateOf(false) }
@@ -157,6 +175,10 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
                 .put("crossfadeSeconds", prefs.getInt("crossfade", 0))
                 .put("replayGain", prefs.getBoolean("replayGain", false))
                 .put("gapless", prefs.getBoolean("gapless", true))
+                .put("playbackSpeed", prefs.getFloat("playbackSpeed", 1f))
+                .put("playbackPitch", prefs.getFloat("playbackPitch", 1f))
+                .put("repeatMode", prefs.getInt("repeatMode", Player.REPEAT_MODE_OFF))
+                .put("shuffle", prefs.getBoolean("shuffle", false))
             runCatching { withContext(Dispatchers.IO) { PresetArchive.exportSettings(activity, uri, values) } }
                 .onFailure { importError = it.message ?: "Settings preset could not be exported." }
         }
@@ -166,6 +188,29 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
             runCatching { withContext(Dispatchers.IO) { PresetArchive.read(activity, uri) } }
                 .onSuccess { imported -> importCandidate = imported; showDependencyApproval = imported.requiredSettings.isNotEmpty() }
                 .onFailure { importError = it.message ?: "Preset could not be opened. Nothing was changed." }
+        }
+    }
+    val playlistExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    activity.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(playlistStore.export()) }
+                        ?: error("Android could not create the playlist export")
+                }
+            }.onFailure { collectionMessage = it.message ?: "Playlists could not be exported." }
+        }
+    }
+    val playlistImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            runCatching {
+                val text = withContext(Dispatchers.IO) {
+                    activity.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { reader -> reader.readText().take(8 * 1024 * 1024 + 1) }
+                        ?: error("Android could not open the playlist file")
+                }
+                require(text.toByteArray(Charsets.UTF_8).size <= 8 * 1024 * 1024) { "Playlist file is too large" }
+                playlistStore.import(text)
+            }.onSuccess { playlists = it; collectionMessage = "Playlists imported. Matching names were updated; other playlists were kept." }
+                .onFailure { collectionMessage = it.message ?: "Playlists could not be imported." }
         }
     }
     val wallpaperPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -212,14 +257,73 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
     }
 
     val latestTracks by rememberUpdatedState(tracks)
+    var sleepTimerJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    fun syncPlayerState() {
+        val active = controller ?: return
+        queueTracks = active.mediaItems.mapNotNull { item -> item.mediaId.toLongOrNull()?.let { id -> latestTracks.firstOrNull { it.id == id } } }
+        val currentId = active.currentMediaItem?.mediaId?.toLongOrNull()
+        playing = currentId?.let { id -> latestTracks.firstOrNull { it.id == id } }
+        playerPosition = active.currentPosition.coerceAtLeast(0L)
+        prefs.edit().putString("queueIds", queueTracks.joinToString(",") { it.id.toString() }).apply()
+        if (currentId != null) prefs.edit().putLong("currentTrackId", currentId).apply()
+        repeatMode = active.repeatMode
+        shuffleEnabled = active.shuffleModeEnabled
+        playbackSpeed = active.playbackParameters.speed
+        playbackPitch = active.playbackParameters.pitch
+        currentBookmark = currentId?.let { prefs.getLong("bookmark_$it", -1L).takeIf { mark -> mark >= 0L } }
+    }
+
+    fun setSleepTimer(minutes: Int) {
+        sleepTimerJob?.cancel()
+        sleepTimerMinutes = minutes.coerceIn(0, 180)
+        if (sleepTimerMinutes > 0) sleepTimerJob = scope.launch {
+            kotlinx.coroutines.delay(sleepTimerMinutes * 60_000L)
+            controller?.pause()
+            sleepTimerMinutes = 0
+            sleepTimerJob = null
+        }
+    }
+
+    LaunchedEffect(tracks, controller) {
+        val active = controller ?: return@LaunchedEffect
+        if (tracks.isEmpty() || active.mediaItemCount > 0) return@LaunchedEffect
+        active.repeatMode = prefs.getInt("repeatMode", Player.REPEAT_MODE_OFF).coerceIn(Player.REPEAT_MODE_OFF, Player.REPEAT_MODE_ALL)
+        active.shuffleModeEnabled = prefs.getBoolean("shuffle", false)
+        active.playbackParameters = androidx.media3.common.PlaybackParameters(playbackSpeed, playbackPitch)
+        val savedIds = prefs.getString("queueIds", null).orEmpty().split(',').mapNotNull(String::toLongOrNull)
+        val restored = savedIds.mapNotNull { id -> tracks.firstOrNull { it.id == id } }
+        if (restored.isNotEmpty()) {
+            val currentId = prefs.getLong("currentTrackId", restored.first().id)
+            val index = restored.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+            val position = prefs.getLong("resume_$currentId", 0L).coerceIn(0L, restored[index].duration)
+            active.setMediaItems(restored.map(Track::toMediaItem), index, position)
+            syncPlayerState()
+        }
+    }
+
     DisposableEffect(controller) {
         val activeController = controller
         if (activeController == null) return@DisposableEffect onDispose { }
         val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(playingNow: Boolean) { isPlaying = playingNow }
+            override fun onIsPlayingChanged(playingNow: Boolean) {
+                isPlaying = playingNow
+                val id = activeController.currentMediaItem?.mediaId?.toLongOrNull()
+                if (id != null) prefs.edit().putLong("resume_$id", activeController.currentPosition.coerceAtLeast(0L)).apply()
+            }
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                val id = mediaItem?.mediaId?.toLongOrNull()
-                playing = id?.let { trackId -> latestTracks.firstOrNull { it.id == trackId } }
+                syncPlayerState()
+            }
+            override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) { syncPlayerState() }
+            override fun onRepeatModeChanged(repeatModeNow: Int) { repeatMode = repeatModeNow; prefs.edit().putInt("repeatMode", repeatModeNow).apply() }
+            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) { shuffleEnabled = shuffleModeEnabled; prefs.edit().putBoolean("shuffle", shuffleModeEnabled).apply() }
+            override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
+                playbackSpeed = playbackParameters.speed
+                playbackPitch = playbackParameters.pitch
+            }
+            override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+                playerPosition = newPosition.positionMs.coerceAtLeast(0L)
+                newPosition.mediaItem?.mediaId?.toLongOrNull()?.let { prefs.edit().putLong("resume_$it", playerPosition).apply() }
             }
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 playbackError = error.message ?: "Playback failed. Check that the file is still available."
@@ -228,9 +332,19 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
         }
         activeController.addListener(listener)
         isPlaying = activeController.isPlaying
+        syncPlayerState()
         onDispose {
             activeController.removeListener(listener)
             activeController.release()
+        }
+    }
+
+    LaunchedEffect(controller, isPlaying) {
+        val active = controller ?: return@LaunchedEffect
+        while (isPlaying) {
+            playerPosition = active.currentPosition.coerceAtLeast(0L)
+            active.currentMediaItem?.mediaId?.toLongOrNull()?.let { id -> prefs.edit().putLong("resume_$id", playerPosition).apply() }
+            kotlinx.coroutines.delay(1_000L)
         }
     }
 
@@ -263,9 +377,12 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
             scanLibrary()
             return
         }
-        player.setMediaItems(queue, startIndex, 0L)
+        val savedPosition = prefs.getLong("resume_${track.id}", 0L).coerceIn(0L, track.duration.coerceAtLeast(1L))
+        val resumePosition = savedPosition.takeIf { it >= 10_000L && it < track.duration - 10_000L } ?: 0L
+        player.setMediaItems(queue, startIndex, resumePosition)
         player.prepare()
         player.play()
+        syncPlayerState()
     }
 
     fun togglePlayback() {
@@ -274,6 +391,44 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
         else if (player.isPlaying) player.pause()
         else if (player.mediaItemCount > 0) player.play()
         else tracks.firstOrNull()?.let(::startPlayback)
+    }
+
+    fun addTrackNext(track: Track) {
+        val player = controller ?: run { playbackError = "The player is still connecting."; return }
+        if (player.mediaItemCount == 0) {
+            startPlayback(track)
+            return
+        }
+        val insertion = (player.currentMediaItemIndex + 1).coerceIn(0, player.mediaItemCount)
+        player.addMediaItem(insertion, track.toMediaItem())
+        syncPlayerState()
+    }
+
+    fun playPlaylist(playlist: SavedPlaylist) {
+        val entries = playlist.trackIds.mapNotNull { id -> tracks.firstOrNull { it.id == id } }
+        if (entries.isEmpty()) { collectionMessage = "This playlist has no tracks available on this device."; return }
+        if (entries.size != playlist.trackIds.size) collectionMessage = "Some playlist tracks are unavailable and were skipped."
+        val player = controller ?: run { playbackError = "The player is still connecting."; return }
+        player.setMediaItems(entries.map(Track::toMediaItem))
+        player.prepare()
+        player.play()
+        syncPlayerState()
+        tab = "Player"
+    }
+
+    fun createPlaylist(name: String, ids: List<Long>) {
+        runCatching { playlistStore.create(name, ids) }
+            .onSuccess { playlists = it; collectionMessage = "Playlist saved." }
+            .onFailure { collectionMessage = it.message ?: "Playlist could not be saved." }
+    }
+
+    fun setPlaybackRate(speed: Float = playbackSpeed, pitch: Float = playbackPitch) {
+        val safeSpeed = speed.coerceIn(.5f, 2f)
+        val safePitch = pitch.coerceIn(.5f, 2f)
+        controller?.playbackParameters = androidx.media3.common.PlaybackParameters(safeSpeed, safePitch)
+        playbackSpeed = safeSpeed
+        playbackPitch = safePitch
+        prefs.edit().putFloat("playbackSpeed", safeSpeed).putFloat("playbackPitch", safePitch).apply()
     }
 
     fun applyPreset(approveDependencies: Boolean) {
@@ -286,6 +441,13 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
                         wallpaperBrightness = a.wallpaperBrightness; wallpaperBlur = a.wallpaperBlur
                     }
                     result.wallpaperPath?.let { wallpaperPath = it }
+                    playbackSpeed = prefs.getFloat("playbackSpeed", 1f).coerceIn(.5f, 2f)
+                    playbackPitch = prefs.getFloat("playbackPitch", 1f).coerceIn(.5f, 2f)
+                    repeatMode = prefs.getInt("repeatMode", Player.REPEAT_MODE_OFF).coerceIn(Player.REPEAT_MODE_OFF, Player.REPEAT_MODE_ALL)
+                    shuffleEnabled = prefs.getBoolean("shuffle", false)
+                    controller?.repeatMode = repeatMode
+                    controller?.shuffleModeEnabled = shuffleEnabled
+                    controller?.playbackParameters = androidx.media3.common.PlaybackParameters(playbackSpeed, playbackPitch)
                     importCandidate = null
                     showDependencyApproval = false
                 }
@@ -315,7 +477,48 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
                         when (tab) {
                             "Listen" -> ListenScreen(tracks, playing, isPlaying, hasAudioAccess, isScanning, libraryMessage, requestAudioAccess, ::startPlayback, ::togglePlayback, { controller?.seekToNextMediaItem() })
                             "Library" -> LibraryScreen(tracks, playing, hasAudioAccess, isScanning, libraryMessage, requestAudioAccess, ::startPlayback)
-                            "Collections" -> CollectionsScreen(tracks)
+                            "Collections" -> CollectionsScreen(
+                                tracks = tracks,
+                                playlists = playlists,
+                                onOpenPlayer = { tab = "Player" },
+                                onCreatePlaylist = { showPlaylistDialog = true; saveQueueInDialog = false; playlistName = "" },
+                                onPlayPlaylist = ::playPlaylist,
+                                onDeletePlaylist = { name -> runCatching { playlistStore.delete(name) }.onSuccess { playlists = it }.onFailure { collectionMessage = it.message } },
+                                onExportPlaylists = { playlistExport.launch("Nexi-playlists.json") },
+                                onImportPlaylists = { playlistImport.launch(arrayOf("application/json", "text/json", "text/plain")) },
+                            )
+                            "Player" -> PlayerScreen(
+                                track = playing,
+                                isPlaying = isPlaying,
+                                positionMs = playerPosition,
+                                repeatMode = repeatMode,
+                                shuffle = shuffleEnabled,
+                                speed = playbackSpeed,
+                                pitch = playbackPitch,
+                                timerMinutes = sleepTimerMinutes,
+                                bookmarkMs = currentBookmark,
+                                queue = queueTracks,
+                                library = tracks,
+                                onToggle = ::togglePlayback,
+                                onPrevious = { controller?.seekToPreviousMediaItem() },
+                                onNext = { controller?.seekToNextMediaItem() },
+                                onSeek = { position -> controller?.seekTo(position); playerPosition = position },
+                                onRepeat = { controller?.repeatMode = when (repeatMode) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ONE; Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL; else -> Player.REPEAT_MODE_OFF } },
+                                onShuffle = { controller?.shuffleModeEnabled = !shuffleEnabled },
+                                onSpeed = { setPlaybackRate(speed = it) },
+                                onPitch = { setPlaybackRate(pitch = it) },
+                                onSleepTimer = ::setSleepTimer,
+                                onBookmark = {
+                                    val id = playing?.id
+                                    if (id != null) { prefs.edit().putLong("bookmark_$id", playerPosition).apply(); currentBookmark = playerPosition }
+                                },
+                                onSeekBookmark = { controller?.seekTo(it) },
+                                onAddNext = ::addTrackNext,
+                                onMoveQueueItem = { from, to -> controller?.moveMediaItem(from, to); syncPlayerState() },
+                                onRemoveQueueItem = { index -> controller?.removeMediaItem(index); syncPlayerState() },
+                                onClearQueue = { controller?.clearMediaItems(); syncPlayerState() },
+                                onSaveQueue = { showPlaylistDialog = true; saveQueueInDialog = true; playlistName = "Queue" },
+                            )
                             else -> CustomizeScreen(accent, dark, corner, density, wallpaperBrightness, wallpaperBlur, wallpaperPath?.let(::File)?.isFile == true,
                                 onAccent = { accent = it; prefs.edit().putInt("accent", it).apply() },
                                 onDark = { dark = it; prefs.edit().putBoolean("dark", it).apply() },
@@ -330,12 +533,30 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
                                 onViewCrashLogs = { crashLog = CrashLogStore.read(activity) },
                             )
                         }
-                        if (playing != null) MiniPlayer(playing!!, isPlaying, ::togglePlayback, { controller?.seekToNextMediaItem() })
+                        if (playing != null) MiniPlayer(playing!!, isPlaying, ::togglePlayback, { controller?.seekToNextMediaItem() }, { tab = "Player" })
                         Navigation(tab) { tab = it }
                     }
                 }
             }
         }
+        if (showPlaylistDialog) AlertDialog(
+            onDismissRequest = { showPlaylistDialog = false },
+            title = { Text(if (saveQueueInDialog) "Save queue as playlist" else "New playlist") },
+            text = { OutlinedTextField(playlistName, { playlistName = it }, label = { Text("Playlist name") }, singleLine = true) },
+            confirmButton = {
+                TextButton(onClick = {
+                    createPlaylist(playlistName, if (saveQueueInDialog) queueTracks.map(Track::id) else emptyList())
+                    showPlaylistDialog = false
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { showPlaylistDialog = false }) { Text("Cancel") } },
+        )
+        if (collectionMessage != null) AlertDialog(
+            onDismissRequest = { collectionMessage = null },
+            title = { Text("Playlists") },
+            text = { Text(collectionMessage.orEmpty()) },
+            confirmButton = { TextButton(onClick = { collectionMessage = null }) { Text("OK") } },
+        )
         if (importError != null) AlertDialog(
             onDismissRequest = { importError = null }, title = { Text("Couldn’t complete that") },
             text = { Text(importError ?: "No changes were made.") },
@@ -446,13 +667,17 @@ private fun putSettings(editor: android.content.SharedPreferences.Editor, values
     if ("crossfadeSeconds" in allowed && values.has("crossfadeSeconds")) editor.putInt("crossfade", values.getInt("crossfadeSeconds"))
     if ("replayGain" in allowed && values.has("replayGain")) editor.putBoolean("replayGain", values.getBoolean("replayGain"))
     if ("gapless" in allowed && values.has("gapless")) editor.putBoolean("gapless", values.getBoolean("gapless"))
+    if ("playbackSpeed" in allowed && values.has("playbackSpeed")) editor.putFloat("playbackSpeed", values.getDouble("playbackSpeed").toFloat())
+    if ("playbackPitch" in allowed && values.has("playbackPitch")) editor.putFloat("playbackPitch", values.getDouble("playbackPitch").toFloat())
+    if ("repeatMode" in allowed && values.has("repeatMode")) editor.putInt("repeatMode", values.getInt("repeatMode"))
+    if ("shuffle" in allowed && values.has("shuffle")) editor.putBoolean("shuffle", values.getBoolean("shuffle"))
 }
 
 @Composable private fun TopHeader(tab: String, modifier: Modifier = Modifier) {
     Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         Column {
             Text("NEXI  /  MUSIC", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Clay, letterSpacing = 2.sp)
-            Text(when (tab) { "Listen" -> "Your sound,\nyour space."; "Library" -> "The library"; "Collections" -> "Made for you"; else -> "Make it yours." }, fontSize = 30.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
+            Text(when (tab) { "Listen" -> "Your sound,\nyour space."; "Library" -> "The library"; "Collections" -> "Made for you"; "Player" -> "In the moment"; else -> "Make it yours." }, fontSize = 30.sp, lineHeight = 32.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
         }
         Box(Modifier.size(44.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surface), Alignment.Center) { Icon(Icons.Filled.Tune, null, tint = Clay) }
     }
@@ -545,19 +770,41 @@ private fun putSettings(editor: android.content.SharedPreferences.Editor, values
     }
 }
 
-@Composable private fun ColumnScope.CollectionsScreen(tracks: List<Track>) {
+@Composable private fun ColumnScope.CollectionsScreen(
+    tracks: List<Track>, playlists: List<SavedPlaylist>, onOpenPlayer: () -> Unit,
+    onCreatePlaylist: () -> Unit, onPlayPlaylist: (SavedPlaylist) -> Unit,
+    onDeletePlaylist: (String) -> Unit, onExportPlaylists: () -> Unit, onImportPlaylists: () -> Unit,
+) {
     LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(horizontal = 22.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Your listening, organized your way.", color = Muted) }
         item { CollectionCard("Recently added", "${tracks.size} tracks", Icons.Filled.Schedule, Color(0xffe9d9cf)) }
-        item { CollectionCard("Favorites", "Keep the ones that stay with you", Icons.Filled.FavoriteBorder, Color(0xffeadfe0)) }
-        item { CollectionCard("Play queue", "Shape what plays next", Icons.Filled.QueueMusic, Color(0xffdfe7dc)) }
+        item { CollectionCard("Play queue", "Edit order, save it, or add what’s next", Icons.Filled.QueueMusic, Color(0xffdfe7dc), onOpenPlayer) }
+        item { CustomizeCard("Your playlists", "ON THIS DEVICE") {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onCreatePlaylist, modifier = Modifier.weight(1f)) { Icon(Icons.Filled.Add, null); Spacer(Modifier.width(5.dp)); Text("New") }
+                OutlinedButton(onClick = onExportPlaylists, modifier = Modifier.weight(1f)) { Icon(Icons.Filled.FileUpload, null); Spacer(Modifier.width(5.dp)); Text("Export") }
+                OutlinedButton(onClick = onImportPlaylists, modifier = Modifier.weight(1f)) { Icon(Icons.Filled.FileDownload, null); Spacer(Modifier.width(5.dp)); Text("Import") }
+            }
+            if (playlists.isEmpty()) Text("No playlists yet. Create one or save the current queue.", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
+            playlists.forEach { playlist ->
+                Row(Modifier.fillMaxWidth().padding(top = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.QueueMusic, null, tint = Clay)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(playlist.name, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("${playlist.trackIds.size} tracks", color = Muted, fontSize = 11.sp)
+                    }
+                    IconButton(onClick = { onPlayPlaylist(playlist) }) { Icon(Icons.Filled.PlayArrow, "Play playlist", tint = Clay) }
+                    IconButton(onClick = { onDeletePlaylist(playlist.name) }) { Icon(Icons.Filled.DeleteOutline, "Delete playlist", tint = Muted) }
+                }
+            }
+        } }
         item { CollectionCard("Folders", "Browse your music by folder", Icons.Filled.FolderOpen, Color(0xffe5e1d4)) }
-        item { Text("Playlists, smart mixes, folders and queue editing are designed to stay on-device.", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(top = 8.dp)) }
     }
 }
 
-@Composable private fun CollectionCard(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color) {
-    Row(Modifier.fillMaxWidth().clip(rounded(22.dp)).background(MaterialTheme.colorScheme.surface).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+@Composable private fun CollectionCard(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color, onClick: () -> Unit = {}) {
+    Row(Modifier.fillMaxWidth().clip(rounded(22.dp)).background(MaterialTheme.colorScheme.surface).clickable(onClick = onClick).padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(52.dp).clip(rounded(17.dp)).background(tint), Alignment.Center) { Icon(icon, null, tint = Ink) }; Spacer(Modifier.width(13.dp)); Column(Modifier.weight(1f)) { Text(title, fontWeight = FontWeight.SemiBold, fontSize = 16.sp); Text(subtitle, fontSize = 12.sp, color = Muted) }; Icon(Icons.Filled.ArrowForward, null, tint = Muted, modifier = Modifier.size(17.dp))
     }
 }
@@ -611,14 +858,14 @@ private fun putSettings(editor: android.content.SharedPreferences.Editor, values
     Row(Modifier.fillMaxWidth().clip(rounded(15.dp)).background(MaterialTheme.colorScheme.background).clickable(onClick = onClick).padding(horizontal = 13.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { Icon(icon, null, tint = Clay, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium); Spacer(Modifier.weight(1f)); Icon(Icons.Filled.ArrowForward, null, tint = Muted, modifier = Modifier.size(15.dp)) }
 }
 
-@Composable private fun MiniPlayer(track: Track, isPlaying: Boolean, onToggle: () -> Unit, onNext: () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 7.dp).clip(rounded(20.dp)).background(Color(0xff302b28)).padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+@Composable private fun MiniPlayer(track: Track, isPlaying: Boolean, onToggle: () -> Unit, onNext: () -> Unit, onOpen: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 7.dp).clip(rounded(20.dp)).background(Color(0xff302b28)).clickable(onClick = onOpen).padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(39.dp).clip(rounded(13.dp)).background(Color(0xff51423b)), Alignment.Center) { Icon(Icons.Filled.MusicNote, null, tint = Color(0xffffc6a9)) }; Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text(track.title, color = Color.White, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(track.artist, color = Color(0xffc6b8af), fontSize = 11.sp, maxLines = 1) }; IconButton(onClick = onToggle) { Icon(if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow, "Play or pause", tint = Color.White) }; IconButton(onClick = onNext) { Icon(Icons.Filled.SkipNext, "Next", tint = Color.White) }
     }
 }
 
 @Composable private fun Navigation(current: String, onSelect: (String) -> Unit) {
-    val items = listOf("Listen" to Icons.Filled.GraphicEq, "Library" to Icons.Filled.LibraryMusic, "Collections" to Icons.Filled.QueueMusic, "Style" to Icons.Filled.Palette)
+    val items = listOf("Listen" to Icons.Filled.GraphicEq, "Library" to Icons.Filled.LibraryMusic, "Player" to Icons.Filled.Album, "Collections" to Icons.Filled.QueueMusic, "Style" to Icons.Filled.Palette)
     Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 8.dp, vertical = 5.dp), horizontalArrangement = Arrangement.SpaceAround) {
         items.forEach { (label, icon) -> val selected = current == label; Column(Modifier.clip(rounded(15.dp)).clickable { onSelect(label) }.padding(horizontal = 13.dp, vertical = 7.dp), horizontalAlignment = Alignment.CenterHorizontally) { Icon(icon, null, tint = if (selected) Clay else Muted, modifier = Modifier.size(21.dp)); Text(label, fontSize = 9.sp, color = if (selected) Clay else Muted, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal) } }
     }

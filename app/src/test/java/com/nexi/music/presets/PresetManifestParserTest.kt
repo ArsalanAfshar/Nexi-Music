@@ -48,6 +48,21 @@ class PresetManifestParserTest {
         assertThrows(IllegalArgumentException::class.java) { PresetManifestParser.parse(badSettings.toString()) }
     }
 
+    @Test fun validatesPlaybackPreferencesAndRejectsUnsafeRanges() {
+        val parsed = PresetManifestParser.parse(
+            """{"format":"nexi-preset","version":1,"kind":"settings","settings":{"playbackSpeed":1.25,"playbackPitch":0.9,"repeatMode":2,"shuffle":true}}""",
+        )
+        assertEquals(1.25, parsed.settings?.getDouble("playbackSpeed") ?: 0.0, 0.001)
+        assertEquals(2, parsed.settings?.getInt("repeatMode"))
+        assertEquals(true, parsed.settings?.getBoolean("shuffle"))
+        assertThrows(IllegalArgumentException::class.java) {
+            PresetManifestParser.parse("""{"format":"nexi-preset","version":1,"kind":"settings","settings":{"playbackSpeed":9}}""")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PresetManifestParser.parse("""{"format":"nexi-preset","version":1,"kind":"settings","settings":{"repeatMode":3}}""")
+        }
+    }
+
     @Test fun validatesPartialSettingsWithoutInventingMissingValues() {
         val parsed = PresetManifestParser.parse(
             """{"format":"nexi-preset","version":1,"kind":"settings","settings":{"crossfadeSeconds":6}}""",

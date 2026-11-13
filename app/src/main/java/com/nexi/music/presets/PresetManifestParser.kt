@@ -5,7 +5,7 @@ import org.json.JSONObject
 
 /** Pure, strict schema validation shared by imports and local JVM tests. */
 object PresetManifestParser {
-    private val settingKeys = setOf("crossfadeSeconds", "replayGain", "gapless")
+    private val settingKeys = setOf("crossfadeSeconds", "replayGain", "gapless", "playbackSpeed", "playbackPitch", "repeatMode", "shuffle")
     private val wallpaperNames = setOf("wallpaper.jpg", "wallpaper.png")
 
     data class Parsed(
@@ -120,8 +120,20 @@ object PresetManifestParser {
             }
             require(raw.toInt() in 0..12) { "crossfadeSeconds must be between 0 and 12" }
         }
-        listOf("replayGain", "gapless").forEach { key ->
+        listOf("replayGain", "gapless", "shuffle").forEach { key ->
             if (settings.has(key)) require(settings.opt(key) is Boolean) { "$key must be true or false" }
+        }
+        listOf("playbackSpeed", "playbackPitch").forEach { key ->
+            if (settings.has(key)) {
+                val raw = settings.opt(key)
+                require(raw is Number && raw.toDouble().isFinite() && raw.toDouble() in .5..2.0) { "$key must be between 0.5 and 2.0" }
+            }
+        }
+        if (settings.has("repeatMode")) {
+            val raw = settings.opt("repeatMode")
+            require(raw is Number && raw.toDouble().isFinite() && raw.toDouble() % 1.0 == 0.0 && raw.toInt() in 0..2) {
+                "repeatMode must be 0 (off), 1 (one), or 2 (all)"
+            }
         }
     }
 }
