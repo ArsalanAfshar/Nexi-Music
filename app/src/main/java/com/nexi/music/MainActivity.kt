@@ -261,7 +261,9 @@ private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
 
     fun syncPlayerState() {
         val active = controller ?: return
-        queueTracks = active.mediaItems.mapNotNull { item -> item.mediaId.toLongOrNull()?.let { id -> latestTracks.firstOrNull { it.id == id } } }
+        queueTracks = (0 until active.mediaItemCount).mapNotNull { index ->
+            active.getMediaItemAt(index).mediaId.toLongOrNull()?.let { id -> latestTracks.firstOrNull { it.id == id } }
+        }
         val currentId = active.currentMediaItem?.mediaId?.toLongOrNull()
         playing = currentId?.let { id -> latestTracks.firstOrNull { it.id == id } }
         playerPosition = active.currentPosition.coerceAtLeast(0L)
