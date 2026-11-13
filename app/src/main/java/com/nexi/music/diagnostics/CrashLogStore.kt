@@ -75,7 +75,7 @@ object CrashLogStore {
                 val trace = if (error == null) "" else StringWriter().also { writer -> error.printStackTrace(PrintWriter(writer)) }.toString()
                 val entry = "\n--- ${System.currentTimeMillis()} ---\n$message\n$trace".toByteArray(Charsets.UTF_8)
                     .takeLast(MAX_ENTRY_BYTES).toByteArray()
-                val existing = file.takeIf(File::isFile)?.readBytes().orEmpty()
+                val existing = file.takeIf(File::isFile)?.readBytes() ?: byteArrayOf()
                 val combined = boundedAppend(existing, entry, MAX_LOG_BYTES)
                 val temporary = File(directory, "crash-log.tmp")
                 temporary.writeBytes(combined)
