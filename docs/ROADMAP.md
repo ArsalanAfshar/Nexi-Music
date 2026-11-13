@@ -5,9 +5,10 @@ This is an honest, staged plan for the vision; the current code is an MVP, not y
 ## Shipped foundations
 
 - MediaStore local-library scan, Media3 playback service/session, basic queue playback, mini-player and search.
+- **v0.2.0 stabilization:** background-thread scanning with visible permission/query errors; lifecycle-safe controller connection and player-state listeners; audio-focus/noisy-route handling; local crash-log viewer; strict preset validation and bounded wallpaper decoding; JVM tests for preset schema and log-size behavior.
 - Compose appearance controls with persistent accent, dark mode, density, shape, wallpaper, brightness and blur.
 - Modular appearance/settings `.nexi` archives, optional bundled wallpaper and opt-in dependency changes.
-- ABI-split APK build and signed tag-release workflow.
+- ABI-split APK build and signed tag-release workflow; public test signing material is explicitly labeled, backed up with v0.1.0, and reused for tagged pre-releases (never production).
 
 ## Next: library and playback completeness
 
