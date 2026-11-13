@@ -40,6 +40,12 @@ jobs:
           if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
             gh release download "$VERSION_TAG" --pattern "$(basename "$keystore")" --dir "$key_dir"
             test -s "$keystore" || { echo 'Existing release is missing its signing-key backup; refusing to rotate it.' >&2; exit 1; }
+          elif [ "$version" != '0.1.0' ]; then
+            # v0.1.0 is the permanent public test-key anchor for subsequent test releases.
+            anchor="$key_dir/Nexi-Music-0.1.0-TEST-KEYSTORE.jks"
+            gh release download v0.1.0 --pattern 'Nexi-Music-0.1.0-TEST-KEYSTORE.jks' --dir "$key_dir"
+            test -s "$anchor" || { echo 'The v0.1.0 test keystore is unavailable; refusing to sign with a different key.' >&2; exit 1; }
+            cp "$anchor" "$keystore"
           else
             keytool -genkeypair -noprompt \
               -keystore "$keystore" -storetype JKS \

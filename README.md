@@ -12,6 +12,7 @@
 - Live appearance controls: accent palette, light/dark mode, interface density, corner scale, custom image wallpaper, wallpaper blur and brightness.
 - **Separate `.nexi` ZIP presets**: export/import appearance (including optional bundled wallpaper) independently from settings. Every import asks for confirmation. The archive format can declare setting dependencies; the app shows those dependencies and asks before applying them.
 - Local-only by default. No account, analytics SDK, or network music service.
+- Phase 0 stabilization: MediaStore scans run off the UI thread and report permission/query errors; playback UI follows the MediaSession player state; wallpaper and preset inputs have bounded, validated decoding; crash logs are local and user-copyable.
 
 The collection, audio-quality and metadata-management screens are intentionally a foundation, not a claim that every planned feature is already implemented. See [the roadmap](docs/ROADMAP.md).
 
@@ -20,7 +21,7 @@ The collection, audio-quality and metadata-management screens are intentionally 
 Requirements: Android Studio (recommended) or Gradle 8.9, JDK 17, Android SDK Platform 35 and Build Tools installed.
 
 ```sh
-gradle assembleDebug
+gradle testDebugUnitTest assembleDebug
 # APK: app/build/outputs/apk/debug/app-debug.apk
 ```
 
@@ -39,7 +40,7 @@ Check **Settings → About phone → Android version / device specifications** o
 
 ## Release maintainers
 
-Tag a version (`v0.1.0`, for example) to run `.github/workflows/release.yml`. The first test release generates a temporary JKS signing identity in GitHub Actions and publishes the keystore and credentials alongside the APKs. Those test credentials are deliberately public; anyone can sign as that identity. Do not reuse them for production. Replace this test setup with a securely controlled, persistent private key before publishing production builds. Keep one production signing key permanently for upgrade compatibility.
+Tag a version (`v0.2.0`, for example) to run `.github/workflows/release.yml`. v0.1.0 established the intentionally public test signing identity; later test releases reuse that same keystore from the v0.1.0 release backup and attach a copy with credentials to each release. Those credentials are public; anyone can sign as that identity. Do not reuse them for production. Replace this test setup with a securely controlled, persistent private key before publishing production builds. Keep one production signing key permanently for upgrade compatibility.
 
 ## Preset format
 

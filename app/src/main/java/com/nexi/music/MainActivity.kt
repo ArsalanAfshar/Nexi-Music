@@ -1,10 +1,11 @@
 package com.nexi.music
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -21,40 +23,49 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.foundation.Image
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Density
-import androidx.compose.runtime.staticCompositionLocalOf
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.nexi.music.data.MusicLibrary
 import com.nexi.music.data.Track
+import com.nexi.music.data.WallpaperStore
+import com.nexi.music.diagnostics.CrashLogStore
 import com.nexi.music.playback.MusicPlaybackService
 import com.nexi.music.presets.PresetArchive
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 
 private val Ink = Color(0xff282724)
-private val Muted = Color(0xff8a8781)
+private val Muted = Color(0xff77746e)
 private val Paper = Color(0xfff7f5f1)
 private val Clay = Color(0xffbd8066)
 private val LocalCornerScale = staticCompositionLocalOf { 1f }
@@ -63,100 +74,378 @@ private val LocalCornerScale = staticCompositionLocalOf { 1f }
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = android.graphics.Color.rgb(247, 245, 241)
-        window.navigationBarColor = android.graphics.Color.rgb(247, 245, 241)
-        window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         setContent { NexiApp(this) }
     }
 }
+
+private fun Track.toMediaItem(): MediaItem = MediaItem.Builder()
+    .setMediaId(id.toString())
+    .setUri(uri)
+    .setMediaMetadata(MediaMetadata.Builder().setTitle(title).setArtist(artist).setAlbumTitle(album).build())
+    .build()
 
 @Composable private fun NexiApp(activity: MainActivity) {
     val prefs = remember { activity.getSharedPreferences("nexi", Context.MODE_PRIVATE) }
     var accent by remember { mutableIntStateOf(prefs.getInt("accent", 0xffbd8066.toInt())) }
     var dark by remember { mutableStateOf(prefs.getBoolean("dark", false)) }
-    var corner by remember { mutableFloatStateOf(prefs.getFloat("corner", 24f)) }
-    var density by remember { mutableFloatStateOf(prefs.getFloat("density", 1f)) }
-    var wallpaperBrightness by remember { mutableFloatStateOf(prefs.getFloat("wallpaperBrightness", .18f)) }
-    var wallpaperBlur by remember { mutableFloatStateOf(prefs.getFloat("wallpaperBlur", 0f)) }
+    var corner by remember { mutableFloatStateOf(prefs.getFloat("corner", 24f).takeIf { it.isFinite() && it in 8f..36f } ?: 24f) }
+    var density by remember { mutableFloatStateOf(prefs.getFloat("density", 1f).takeIf { it.isFinite() && it in .85f..1.15f } ?: 1f) }
+    var wallpaperBrightness by remember { mutableFloatStateOf(prefs.getFloat("wallpaperBrightness", .18f).takeIf { it.isFinite() && it in 0f..0.6f } ?: .18f) }
+    var wallpaperBlur by remember { mutableFloatStateOf(prefs.getFloat("wallpaperBlur", 0f).takeIf { it.isFinite() && it in 0f..24f } ?: 0f) }
     var wallpaperPath by remember { mutableStateOf(prefs.getString("wallpaperPath", null)) }
     var tab by remember { mutableStateOf("Listen") }
     var tracks by remember { mutableStateOf(emptyList<Track>()) }
     var playing by remember { mutableStateOf<Track?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
     var controller by remember { mutableStateOf<MediaController?>(null) }
+    var hasAudioAccess by remember { mutableStateOf(ContextCompat.checkSelfPermission(activity, audioPermission()) == PackageManager.PERMISSION_GRANTED) }
+    var isScanning by remember { mutableStateOf(false) }
+    var libraryMessage by remember { mutableStateOf<String?>(null) }
+    var playbackError by remember { mutableStateOf<String?>(null) }
     var importError by remember { mutableStateOf<String?>(null) }
     var importCandidate by remember { mutableStateOf<PresetArchive.Imported?>(null) }
     var showDependencyApproval by remember { mutableStateOf(false) }
+    var crashLog by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-    val appearanceExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri -> if (uri != null) runCatching { PresetArchive.exportAppearance(activity, uri, PresetArchive.Appearance(accent, dark, corner, density, wallpaperBrightness, wallpaperBlur, wallpaperPath), wallpaperPath?.let(::File)?.takeIf(File::exists)?.readBytes()) }.onFailure { importError = it.message } }
-    val settingsExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri -> if (uri != null) runCatching { PresetArchive.exportSettings(activity, uri, JSONObject().put("crossfadeSeconds", prefs.getInt("crossfade", 0)).put("replayGain", prefs.getBoolean("replayGain", false)).put("gapless", prefs.getBoolean("gapless", true))) }.onFailure { importError = it.message } }
-    val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) runCatching { PresetArchive.read(activity, uri).also { importCandidate = it; showDependencyApproval = it.requiredSettings.isNotEmpty() } }.onFailure { importError = it.message } }
-    val wallpaperPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) runCatching { activity.contentResolver.openInputStream(uri)?.use { input -> val file = File(activity.filesDir, "wallpaper-${System.currentTimeMillis()}.image"); file.outputStream().use { output -> input.copyTo(output) }; wallpaperPath = file.absolutePath; prefs.edit().putString("wallpaperPath", wallpaperPath).apply() } }.onFailure { importError = it.message } }
-
-    val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> if (granted) tracks = MusicLibrary.scan(activity) }
-    LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(activity, permission) == PackageManager.PERMISSION_GRANTED) tracks = MusicLibrary.scan(activity) else permissionLauncher.launch(permission)
-        val token = SessionToken(activity, ComponentName(activity, MusicPlaybackService::class.java))
-        val future = MediaController.Builder(activity, token).buildAsync()
-        future.addListener({ runCatching { controller = future.get() } }, ContextCompat.getMainExecutor(activity))
+    val scanLibrary: () -> Unit = {
+        scope.launch {
+            if (!hasAudioAccess || isScanning) return@launch
+            isScanning = true
+            libraryMessage = null
+            runCatching { MusicLibrary.scan(activity) }
+                .onSuccess { tracks = it }
+                .onFailure {
+                    libraryMessage = it.message ?: "The music library could not be scanned."
+                    CrashLogStore.record(activity, "MediaStore library scan failed", it)
+                }
+            isScanning = false
+        }
+        Unit
     }
-    DisposableEffect(controller) { onDispose { controller?.release() } }
 
-    val accentColor = Color(accent)
-    val colorScheme = if (dark) darkColorScheme(primary = accentColor, background = Color(0xff1f201f), surface = Color(0xff292a28), onBackground = Color(0xfff2f0ec), onSurface = Color(0xfff2f0ec)) else lightColorScheme(primary = accentColor, background = Paper, surface = Color.White, onBackground = Ink, onSurface = Ink)
-    MaterialTheme(colorScheme = colorScheme) {
-        val baseDensity = LocalDensity.current
-        CompositionLocalProvider(LocalCornerScale provides (corner / 24f), LocalDensity provides Density(density = baseDensity.density * density, fontScale = baseDensity.fontScale)) {
-        Surface(Modifier.fillMaxSize(), color = colorScheme.background) {
-            Box(Modifier.fillMaxSize()) {
-                val wallpaper = remember(wallpaperPath) { wallpaperPath?.let { loadWallpaper(it) }?.asImageBitmap() }
-                if (wallpaper != null) {
-                    Image(wallpaper, null, modifier = Modifier.fillMaxSize().blur(wallpaperBlur.dp), contentScale = ContentScale.Crop)
-                    Box(Modifier.fillMaxSize().background((if (dark) Color.Black else colorScheme.background).copy(alpha = (0.75f * (1f - wallpaperBrightness / 0.6f)).coerceIn(0f, 0.75f))))
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        hasAudioAccess = granted
+        if (granted) {
+            libraryMessage = null
+            scanLibrary()
+        } else {
+            libraryMessage = "Audio access was denied. You can allow it later to show local music."
+        }
+    }
+    val requestAudioAccess: () -> Unit = {
+        if (ContextCompat.checkSelfPermission(activity, audioPermission()) == PackageManager.PERMISSION_GRANTED) {
+            hasAudioAccess = true
+            scanLibrary()
+        } else permissionLauncher.launch(audioPermission())
+    }
+
+    val appearanceExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) scope.launch {
+            runCatching {
+                val wallpaper = wallpaperPath?.let { path -> withContext(Dispatchers.IO) { WallpaperStore.readFile(File(path)) } }
+                withContext(Dispatchers.IO) {
+                    PresetArchive.exportAppearance(activity, uri, PresetArchive.Appearance(accent, dark, corner, density, wallpaperBrightness, wallpaperBlur, wallpaperPath), wallpaper)
                 }
-                Column(Modifier.fillMaxSize()) {
-                TopHeader(tab, Modifier.padding(horizontal = 22.dp, vertical = 12.dp))
-                when (tab) {
-                    "Listen" -> ListenScreen(tracks, playing, isPlaying, onChoose = { track ->
-                        playing = track; isPlaying = true
-                        val items = tracks.map { MediaItem.Builder().setUri(it.uri).setMediaMetadata(MediaMetadata.Builder().setTitle(it.title).setArtist(it.artist).setAlbumTitle(it.album).build()).build() }
-                        controller?.setMediaItems(items, tracks.indexOf(track), 0); controller?.prepare(); controller?.play()
-                    }, onToggle = { if (controller?.isPlaying == true) { controller?.pause(); isPlaying = false } else { controller?.play(); isPlaying = true } }, onNext = { controller?.seekToNextMediaItem(); val i = tracks.indexOf(playing); if (i >= 0 && tracks.isNotEmpty()) playing = tracks[(i + 1) % tracks.size] })
-                    "Library" -> LibraryScreen(tracks, playing, onChoose = { track -> playing = track; isPlaying = true; val items = tracks.map { MediaItem.fromUri(it.uri) }; controller?.setMediaItems(items, tracks.indexOf(track), 0); controller?.prepare(); controller?.play() })
-                    "Collections" -> CollectionsScreen(tracks)
-                    else -> CustomizeScreen(accent, dark, corner, density, wallpaperBrightness, wallpaperBlur, wallpaperPath != null, onAccent = { accent = it; prefs.edit().putInt("accent", it).apply() }, onDark = { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onCorner = { corner = it; prefs.edit().putFloat("corner", it).apply() }, onDensity = { density = it; prefs.edit().putFloat("density", it).apply() }, onBrightness = { wallpaperBrightness = it; prefs.edit().putFloat("wallpaperBrightness", it).apply() }, onBlur = { wallpaperBlur = it; prefs.edit().putFloat("wallpaperBlur", it).apply() }, onWallpaper = { wallpaperPicker.launch("image/*") }, onExportAppearance = { appearanceExport.launch("Nexi-appearance.nexi") }, onExportSettings = { settingsExport.launch("Nexi-settings.nexi") }, onImport = { importPicker.launch(arrayOf("application/zip", "application/octet-stream")) })
+            }.onFailure { importError = it.message ?: "Appearance preset could not be exported." }
+        }
+    }
+    val settingsExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) scope.launch {
+            val values = JSONObject()
+                .put("crossfadeSeconds", prefs.getInt("crossfade", 0))
+                .put("replayGain", prefs.getBoolean("replayGain", false))
+                .put("gapless", prefs.getBoolean("gapless", true))
+            runCatching { withContext(Dispatchers.IO) { PresetArchive.exportSettings(activity, uri, values) } }
+                .onFailure { importError = it.message ?: "Settings preset could not be exported." }
+        }
+    }
+    val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            runCatching { withContext(Dispatchers.IO) { PresetArchive.read(activity, uri) } }
+                .onSuccess { imported -> importCandidate = imported; showDependencyApproval = imported.requiredSettings.isNotEmpty() }
+                .onFailure { importError = it.message ?: "Preset could not be opened. Nothing was changed." }
+        }
+    }
+    val wallpaperPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            val previousPath = wallpaperPath
+            runCatching {
+                val file = withContext(Dispatchers.IO) { WallpaperStore.save(activity, WallpaperStore.readUri(activity, uri)) }
+                if (!prefs.edit().putString("wallpaperPath", file.absolutePath).commit()) {
+                    val rollback = prefs.edit()
+                    if (previousPath == null) rollback.remove("wallpaperPath") else rollback.putString("wallpaperPath", previousPath)
+                    rollback.commit()
+                    file.delete()
+                    error("Wallpaper was processed but settings could not be saved; the prior wallpaper is unchanged.")
                 }
-                if (playing != null) MiniPlayer(playing!!, isPlaying, onToggle = { if (controller?.isPlaying == true) { controller?.pause(); isPlaying = false } else { controller?.play(); isPlaying = true } }, onNext = { controller?.seekToNextMediaItem(); val i = tracks.indexOf(playing); if (i >= 0 && tracks.isNotEmpty()) playing = tracks[(i + 1) % tracks.size] })
-                Navigation(tab) { tab = it }
+                wallpaperPath = file.absolutePath
+                previousPath?.let(::File)?.takeIf { it.parentFile == File(activity.filesDir, "wallpapers") }?.delete()
+            }.onFailure { importError = it.message ?: "Wallpaper could not be loaded." }
+        }
+    }
+
+    val controllerFuture = remember(activity) {
+        MediaController.Builder(activity, SessionToken(activity, ComponentName(activity, MusicPlaybackService::class.java))).buildAsync()
+    }
+    DisposableEffect(controllerFuture) {
+        var disposed = false
+        controllerFuture.addListener({
+            try {
+                val connected = controllerFuture.get()
+                if (disposed) connected.release() else controller = connected
+            } catch (error: Exception) {
+                if (!disposed) {
+                    playbackError = "The playback service could not start. Please try again."
+                    CrashLogStore.record(activity, "MediaController connection failed", error)
+                }
+            }
+        }, ContextCompat.getMainExecutor(activity))
+        onDispose {
+            disposed = true
+            MediaController.releaseFuture(controllerFuture)
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (hasAudioAccess) scanLibrary() else permissionLauncher.launch(audioPermission())
+    }
+
+    val latestTracks by rememberUpdatedState(tracks)
+    DisposableEffect(controller) {
+        val activeController = controller
+        if (activeController == null) return@DisposableEffect onDispose { }
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(playingNow: Boolean) { isPlaying = playingNow }
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                val id = mediaItem?.mediaId?.toLongOrNull()
+                playing = id?.let { trackId -> latestTracks.firstOrNull { it.id == trackId } }
+            }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                playbackError = error.message ?: "Playback failed. Check that the file is still available."
+                CrashLogStore.record(activity, "Media3 player error ${error.errorCodeName}", error)
+            }
+        }
+        activeController.addListener(listener)
+        isPlaying = activeController.isPlaying
+        onDispose {
+            activeController.removeListener(listener)
+            activeController.release()
+        }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val granted = ContextCompat.checkSelfPermission(activity, audioPermission()) == PackageManager.PERMISSION_GRANTED
+                hasAudioAccess = granted
+                if (granted) scanLibrary() else {
+                    tracks = emptyList()
+                    isScanning = false
+                    libraryMessage = "Audio access is off. Allow it again to view your local music."
                 }
             }
         }
-        if (importError != null) AlertDialog(onDismissRequest = { importError = null }, title = { Text("Couldn’t complete that") }, text = { Text(importError ?: "") }, confirmButton = { TextButton(onClick = { importError = null }) { Text("OK") } })
-        if (showDependencyApproval) AlertDialog(onDismissRequest = { showDependencyApproval = false; importCandidate = null }, title = { Text("This look needs settings") }, text = { Text("This appearance preset asks to change: ${importCandidate?.requiredSettings?.joinToString()}. Approve those changes? Nothing is changed until you choose.") }, confirmButton = { TextButton(onClick = { applyImported(activity, importCandidate, prefs, onAppearance = { a -> accent = a.accent; dark = a.dark; corner = a.corner; density = a.density; wallpaperBrightness = a.wallpaperBrightness; wallpaperBlur = a.wallpaperBlur }, onWallpaper = { path -> wallpaperPath = path }) ; showDependencyApproval = false }) { Text("Approve & import") } }, dismissButton = { TextButton(onClick = { showDependencyApproval = false; importCandidate = null }) { Text("Decline") } })
-        else if (importCandidate != null) AlertDialog(onDismissRequest = { importCandidate = null }, title = { Text("Import ${importCandidate?.kind} preset?") }, text = { Text(if (importCandidate?.kind == "appearance") "Only appearance will be applied. Your playback and library settings stay untouched." else "Only settings in this preset will be applied. Your appearance stays untouched.") }, confirmButton = { TextButton(onClick = { applyImported(activity, importCandidate, prefs, onAppearance = { a -> accent = a.accent; dark = a.dark; corner = a.corner; density = a.density; wallpaperBrightness = a.wallpaperBrightness; wallpaperBlur = a.wallpaperBlur }, onWallpaper = { path -> wallpaperPath = path }); importCandidate = null }) { Text("Import") } }, dismissButton = { TextButton(onClick = { importCandidate = null }) { Text("Cancel") } })
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    fun startPlayback(track: Track) {
+        val player = controller
+        if (player == null) {
+            playbackError = "The playback service is still connecting. Try again in a moment."
+            return
+        }
+        val queue = tracks.map(Track::toMediaItem)
+        val startIndex = queue.indexOfFirst { it.mediaId == track.id.toString() }
+        if (startIndex < 0) {
+            playbackError = "That track is no longer in the scanned library. Refresh and try again."
+            scanLibrary()
+            return
+        }
+        player.setMediaItems(queue, startIndex, 0L)
+        player.prepare()
+        player.play()
+    }
+
+    fun togglePlayback() {
+        val player = controller
+        if (player == null) playbackError = "The playback service is still connecting. Try again in a moment."
+        else if (player.isPlaying) player.pause()
+        else if (player.mediaItemCount > 0) player.play()
+        else tracks.firstOrNull()?.let(::startPlayback)
+    }
+
+    fun applyPreset(approveDependencies: Boolean) {
+        val candidate = importCandidate ?: return
+        scope.launch {
+            runCatching { withContext(Dispatchers.IO) { applyImported(activity, candidate, prefs, approveDependencies) } }
+                .onSuccess { result ->
+                    result.appearance?.let { a ->
+                        accent = a.accent; dark = a.dark; corner = a.corner; density = a.density
+                        wallpaperBrightness = a.wallpaperBrightness; wallpaperBlur = a.wallpaperBlur
+                    }
+                    result.wallpaperPath?.let { wallpaperPath = it }
+                    importCandidate = null
+                    showDependencyApproval = false
+                }
+                .onFailure { importError = it.message ?: "Preset was not applied; your current settings are unchanged." }
         }
     }
-}
 
-private fun applyImported(context: Context, candidate: PresetArchive.Imported?, prefs: android.content.SharedPreferences, onAppearance: (PresetArchive.Appearance) -> Unit, onWallpaper: (String) -> Unit) {
-    if (candidate?.kind == "appearance") candidate.appearance?.let { a -> onAppearance(a); prefs.edit().putInt("accent", a.accent).putBoolean("dark", a.dark).putFloat("corner", a.corner).putFloat("density", a.density).putFloat("wallpaperBrightness", a.wallpaperBrightness).putFloat("wallpaperBlur", a.wallpaperBlur).apply() }
-    if (candidate?.kind == "settings") candidate.settings?.let { values -> applySettings(prefs, values, values.keys().asSequence().toSet()) }
-    if (candidate?.kind == "appearance" && candidate.requiredSettings.isNotEmpty()) candidate.settings?.let { values -> applySettings(prefs, values, candidate.requiredSettings.toSet()) }
-    if (candidate?.wallpaperBytes != null) {
-        val file = File(context.filesDir, "wallpaper-${System.currentTimeMillis()}.image")
-        file.writeBytes(candidate.wallpaperBytes)
-        prefs.edit().putString("wallpaperPath", file.absolutePath).apply()
-        onWallpaper(file.absolutePath)
+    val colorScheme = if (dark) darkColorScheme(primary = Color(accent), background = Color(0xff1f201f), surface = Color(0xff292a28), onBackground = Color(0xfff2f0ec), onSurface = Color(0xfff2f0ec))
+        else lightColorScheme(primary = Color(accent), background = Paper, surface = Color.White, onBackground = Ink, onSurface = Ink)
+    SideEffect {
+        activity.window.statusBarColor = (if (dark) android.graphics.Color.rgb(31, 32, 31) else android.graphics.Color.rgb(247, 245, 241))
+        activity.window.navigationBarColor = (if (dark) android.graphics.Color.rgb(31, 32, 31) else android.graphics.Color.rgb(247, 245, 241))
+        activity.window.decorView.systemUiVisibility = if (dark) 0 else android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+    }
+    MaterialTheme(colorScheme = colorScheme) {
+        val baseDensity = LocalDensity.current
+        CompositionLocalProvider(LocalCornerScale provides corner / 24f, LocalDensity provides Density(baseDensity.density * density, baseDensity.fontScale)) {
+            Surface(Modifier.fillMaxSize(), color = colorScheme.background) {
+                Box(Modifier.fillMaxSize()) {
+                    val wallpaper = remember(wallpaperPath) { wallpaperPath?.let(::loadWallpaper)?.asImageBitmap() }
+                    if (wallpaper != null) {
+                        Image(wallpaper, null, modifier = Modifier.fillMaxSize().blur(wallpaperBlur.dp), contentScale = ContentScale.Crop)
+                        Box(Modifier.fillMaxSize().background((if (dark) Color.Black else colorScheme.background).copy(alpha = (0.75f * (1f - wallpaperBrightness / 0.6f)).coerceIn(0f, 0.75f))))
+                    }
+                    Column(Modifier.fillMaxSize()) {
+                        TopHeader(tab, Modifier.padding(horizontal = 22.dp, vertical = 12.dp))
+                        when (tab) {
+                            "Listen" -> ListenScreen(tracks, playing, isPlaying, hasAudioAccess, isScanning, libraryMessage, requestAudioAccess, ::startPlayback, ::togglePlayback, { controller?.seekToNextMediaItem() })
+                            "Library" -> LibraryScreen(tracks, playing, hasAudioAccess, isScanning, libraryMessage, requestAudioAccess, ::startPlayback)
+                            "Collections" -> CollectionsScreen(tracks)
+                            else -> CustomizeScreen(accent, dark, corner, density, wallpaperBrightness, wallpaperBlur, wallpaperPath?.let(::File)?.isFile == true,
+                                onAccent = { accent = it; prefs.edit().putInt("accent", it).apply() },
+                                onDark = { dark = it; prefs.edit().putBoolean("dark", it).apply() },
+                                onCorner = { corner = it; prefs.edit().putFloat("corner", it).apply() },
+                                onDensity = { density = it; prefs.edit().putFloat("density", it).apply() },
+                                onBrightness = { wallpaperBrightness = it; prefs.edit().putFloat("wallpaperBrightness", it).apply() },
+                                onBlur = { wallpaperBlur = it; prefs.edit().putFloat("wallpaperBlur", it).apply() },
+                                onWallpaper = { wallpaperPicker.launch("image/*") },
+                                onExportAppearance = { appearanceExport.launch("Nexi-appearance.nexi") },
+                                onExportSettings = { settingsExport.launch("Nexi-settings.nexi") },
+                                onImport = { importPicker.launch(arrayOf("application/zip", "application/octet-stream")) },
+                                onViewCrashLogs = { crashLog = CrashLogStore.read(activity) },
+                            )
+                        }
+                        if (playing != null) MiniPlayer(playing!!, isPlaying, ::togglePlayback, { controller?.seekToNextMediaItem() })
+                        Navigation(tab) { tab = it }
+                    }
+                }
+            }
+        }
+        if (importError != null) AlertDialog(
+            onDismissRequest = { importError = null }, title = { Text("Couldn’t complete that") },
+            text = { Text(importError ?: "No changes were made.") },
+            confirmButton = { TextButton(onClick = { importError = null }) { Text("OK") } },
+        )
+        if (playbackError != null) AlertDialog(
+            onDismissRequest = { playbackError = null }, title = { Text("Playback issue") },
+            text = { Text(playbackError ?: "") },
+            confirmButton = { TextButton(onClick = { playbackError = null }) { Text("OK") } },
+        )
+        if (showDependencyApproval) AlertDialog(
+            onDismissRequest = { showDependencyApproval = false; importCandidate = null },
+            title = { Text("This appearance needs settings") },
+            text = { Text("The preset requests these setting changes: ${importCandidate?.requiredSettings?.joinToString()}. Approve them? Declining keeps every current setting unchanged.") },
+            confirmButton = { TextButton(onClick = { applyPreset(true) }) { Text("Approve & import") } },
+            dismissButton = { TextButton(onClick = { showDependencyApproval = false; importCandidate = null }) { Text("Decline") } },
+        ) else if (importCandidate != null) AlertDialog(
+            onDismissRequest = { importCandidate = null },
+            title = { Text("Preview ${importCandidate?.kind} preset") },
+            text = { Text(if (importCandidate?.kind == "appearance") "This will change only appearance. Playback and library settings stay untouched." else "This will change only settings included in this preset. Appearance stays untouched.") },
+            confirmButton = { TextButton(onClick = { applyPreset(false) }) { Text("Apply preset") } },
+            dismissButton = { TextButton(onClick = { importCandidate = null }) { Text("Cancel") } },
+        )
+        if (crashLog != null) AlertDialog(
+            onDismissRequest = { crashLog = null },
+            title = { Text("On-device crash log") },
+            text = {
+                val value = crashLog.orEmpty()
+                if (value.isBlank()) Text("No crash log has been recorded on this device.")
+                else Text(value, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    manager.setPrimaryClip(ClipData.newPlainText("Nexi Music crash log", crashLog.orEmpty()))
+                }) { Text("Copy") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { CrashLogStore.clear(activity); crashLog = "" }) { Text("Clear") }
+                    TextButton(onClick = { crashLog = null }) { Text("Close") }
+                }
+            },
+        )
     }
 }
 
-private fun applySettings(prefs: android.content.SharedPreferences, values: JSONObject, allowed: Set<String>) {
-    val edit = prefs.edit()
-    if ("crossfadeSeconds" in allowed && values.has("crossfadeSeconds")) edit.putInt("crossfade", values.optInt("crossfadeSeconds").coerceIn(0, 12))
-    if ("replayGain" in allowed && values.has("replayGain")) edit.putBoolean("replayGain", values.optBoolean("replayGain"))
-    if ("gapless" in allowed && values.has("gapless")) edit.putBoolean("gapless", values.optBoolean("gapless"))
-    edit.apply()
+private fun audioPermission(): String = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+
+private data class AppliedPreset(val appearance: PresetArchive.Appearance?, val wallpaperPath: String?)
+
+private fun applyImported(context: Context, candidate: PresetArchive.Imported, prefs: android.content.SharedPreferences, approveDependencies: Boolean): AppliedPreset {
+    val preferenceSnapshot = prefs.all.toMap()
+    val oldWallpaperPath = prefs.getString("wallpaperPath", null)
+    val editor = prefs.edit()
+    var updatedAppearance: PresetArchive.Appearance? = null
+    var updatedWallpaperPath: String? = null
+    var newWallpaper: File? = null
+    if (candidate.kind == "appearance") {
+        val appearance = requireNotNull(candidate.appearance)
+        if (candidate.wallpaperBytes != null) {
+            newWallpaper = WallpaperStore.save(context, candidate.wallpaperBytes)
+            updatedWallpaperPath = newWallpaper.absolutePath
+        }
+        editor.putInt("accent", appearance.accent)
+            .putBoolean("dark", appearance.dark)
+            .putFloat("corner", appearance.corner)
+            .putFloat("density", appearance.density)
+            .putFloat("wallpaperBrightness", appearance.wallpaperBrightness)
+            .putFloat("wallpaperBlur", appearance.wallpaperBlur)
+        updatedAppearance = appearance
+        if (approveDependencies && candidate.requiredSettings.isNotEmpty()) {
+            putSettings(editor, requireNotNull(candidate.settings), candidate.requiredSettings.toSet())
+        }
+        if (updatedWallpaperPath != null) editor.putString("wallpaperPath", updatedWallpaperPath)
+    } else {
+        putSettings(editor, requireNotNull(candidate.settings), candidate.settings.keys().asSequence().toSet())
+    }
+    if (!editor.commit()) {
+        restorePreferences(prefs, preferenceSnapshot)
+        newWallpaper?.delete()
+        error("Could not save the preset. Your existing settings were left unchanged.")
+    }
+    if (updatedAppearance != null && updatedWallpaperPath == null) updatedWallpaperPath = prefs.getString("wallpaperPath", null)
+    if (newWallpaper != null && oldWallpaperPath != null && oldWallpaperPath != newWallpaper.absolutePath) {
+        val oldFile = File(oldWallpaperPath)
+        if (oldFile.parentFile == File(context.filesDir, "wallpapers")) oldFile.delete()
+    }
+    return AppliedPreset(updatedAppearance, updatedWallpaperPath)
+}
+
+private fun restorePreferences(prefs: android.content.SharedPreferences, snapshot: Map<String, *>) {
+    val editor = prefs.edit().clear()
+    snapshot.forEach { (key, value) ->
+        when (value) {
+            is String -> editor.putString(key, value)
+            is Boolean -> editor.putBoolean(key, value)
+            is Int -> editor.putInt(key, value)
+            is Long -> editor.putLong(key, value)
+            is Float -> editor.putFloat(key, value)
+            is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+        }
+    }
+    editor.commit()
+}
+
+private fun putSettings(editor: android.content.SharedPreferences.Editor, values: JSONObject, allowed: Set<String>) {
+    if ("crossfadeSeconds" in allowed && values.has("crossfadeSeconds")) editor.putInt("crossfade", values.getInt("crossfadeSeconds"))
+    if ("replayGain" in allowed && values.has("replayGain")) editor.putBoolean("replayGain", values.getBoolean("replayGain"))
+    if ("gapless" in allowed && values.has("gapless")) editor.putBoolean("gapless", values.getBoolean("gapless"))
 }
 
 @Composable private fun TopHeader(tab: String, modifier: Modifier = Modifier) {
@@ -169,7 +458,12 @@ private fun applySettings(prefs: android.content.SharedPreferences, values: JSON
     }
 }
 
-@Composable private fun ColumnScope.ListenScreen(tracks: List<Track>, playing: Track?, isPlaying: Boolean, onChoose: (Track) -> Unit, onToggle: () -> Unit, onNext: () -> Unit) {
+@Composable private fun ColumnScope.ListenScreen(
+    tracks: List<Track>, playing: Track?, isPlaying: Boolean,
+    hasAudioAccess: Boolean, isScanning: Boolean, libraryMessage: String?,
+    onRequestAudioAccess: () -> Unit, onChoose: (Track) -> Unit,
+    onToggle: () -> Unit, onNext: () -> Unit,
+) {
     LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(horizontal = 22.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -190,7 +484,7 @@ private fun applySettings(prefs: android.content.SharedPreferences, values: JSON
             }
         }
         item { SectionTitle("Pick up the feeling", "PLAY SOMETHING") }
-        if (tracks.isEmpty()) item { EmptyLibrary() }
+        if (tracks.isEmpty()) item { EmptyLibrary(hasAudioAccess, isScanning, libraryMessage, onRequestAudioAccess) }
         else items(tracks.take(6), key = { it.id }) { TrackRow(it, it == playing, onClick = { onChoose(it) }) }
     }
 }
@@ -217,19 +511,37 @@ private fun applySettings(prefs: android.content.SharedPreferences, values: JSON
     }
 }
 
-@Composable private fun EmptyLibrary() {
+@Composable private fun EmptyLibrary(hasAudioAccess: Boolean, isScanning: Boolean, message: String?, onRequestAudioAccess: () -> Unit) {
     Column(Modifier.fillMaxWidth().clip(rounded(24.dp)).background(MaterialTheme.colorScheme.surface).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(Icons.Filled.LibraryMusic, null, tint = Clay, modifier = Modifier.size(28.dp)); Spacer(Modifier.height(8.dp)); Text("Your music lives here", fontWeight = FontWeight.SemiBold); Text("Allow audio access to find music stored on this device.", color = Muted, fontSize = 12.sp)
+        Icon(Icons.Filled.LibraryMusic, null, tint = Clay, modifier = Modifier.size(28.dp))
+        Spacer(Modifier.height(8.dp))
+        Text(if (hasAudioAccess) "No music found yet" else "Your music stays on your device", fontWeight = FontWeight.SemiBold)
+        Text(message ?: if (hasAudioAccess) "Add audio files to this device, then refresh your library." else "Allow audio access to find music stored on this device.", color = Muted, fontSize = 12.sp)
+        Spacer(Modifier.height(8.dp))
+        when {
+            isScanning -> CircularProgressIndicator(Modifier.size(24.dp), color = Clay, strokeWidth = 2.dp)
+            !hasAudioAccess -> Button(onClick = onRequestAudioAccess) { Text("Allow audio access") }
+            else -> TextButton(onClick = onRequestAudioAccess) { Text("Refresh library") }
+        }
     }
 }
 
-@Composable private fun ColumnScope.LibraryScreen(tracks: List<Track>, playing: Track?, onChoose: (Track) -> Unit) {
+@Composable private fun ColumnScope.LibraryScreen(
+    tracks: List<Track>, playing: Track?, hasAudioAccess: Boolean, isScanning: Boolean,
+    libraryMessage: String?, onRequestAudioAccess: () -> Unit, onChoose: (Track) -> Unit,
+) {
     var query by remember { mutableStateOf("") }
     val filtered = tracks.filter { it.title.contains(query, true) || it.artist.contains(query, true) || it.album.contains(query, true) }
     Column(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 22.dp)) {
         OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = { Text("Search songs, artists, albums") }, leadingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, shape = rounded(18.dp))
         Spacer(Modifier.height(8.dp)); Text("${filtered.size} TRACKS  ·  ON THIS DEVICE", fontSize = 10.sp, color = Muted, letterSpacing = 1.sp)
-        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(vertical = 8.dp)) { items(filtered, key = { it.id }) { TrackRow(it, it == playing) { onChoose(it) } }; if (filtered.isEmpty()) item { EmptyLibrary() } }
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(vertical = 8.dp)) {
+            items(filtered, key = { it.id }) { TrackRow(it, it == playing) { onChoose(it) } }
+            if (filtered.isEmpty()) item {
+                if (tracks.isEmpty()) EmptyLibrary(hasAudioAccess, isScanning, libraryMessage, onRequestAudioAccess)
+                else Text("No tracks match ‘$query’.", color = Muted, modifier = Modifier.padding(vertical = 18.dp))
+            }
+        }
     }
 }
 
@@ -250,7 +562,7 @@ private fun applySettings(prefs: android.content.SharedPreferences, values: JSON
     }
 }
 
-@Composable private fun ColumnScope.CustomizeScreen(accent: Int, dark: Boolean, corner: Float, density: Float, brightness: Float, blur: Float, hasWallpaper: Boolean, onAccent: (Int) -> Unit, onDark: (Boolean) -> Unit, onCorner: (Float) -> Unit, onDensity: (Float) -> Unit, onBrightness: (Float) -> Unit, onBlur: (Float) -> Unit, onWallpaper: () -> Unit, onExportAppearance: () -> Unit, onExportSettings: () -> Unit, onImport: () -> Unit) {
+@Composable private fun ColumnScope.CustomizeScreen(accent: Int, dark: Boolean, corner: Float, density: Float, brightness: Float, blur: Float, hasWallpaper: Boolean, onAccent: (Int) -> Unit, onDark: (Boolean) -> Unit, onCorner: (Float) -> Unit, onDensity: (Float) -> Unit, onBrightness: (Float) -> Unit, onBlur: (Float) -> Unit, onWallpaper: () -> Unit, onExportAppearance: () -> Unit, onExportSettings: () -> Unit, onImport: () -> Unit, onViewCrashLogs: () -> Unit) {
     val swatches = listOf(0xffbd8066.toInt(), 0xff7a8b70.toInt(), 0xff6e88a2.toInt(), 0xffa17b9b.toInt(), 0xffc09c4f.toInt(), 0xff514e87.toInt())
     LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(horizontal = 22.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("A visual engine, not a preset menu. Tune the details until it feels like yours.", color = Muted, fontSize = 13.sp) }
@@ -272,6 +584,10 @@ private fun applySettings(prefs: android.content.SharedPreferences, values: JSON
             Spacer(Modifier.height(12.dp)); ActionButton("Export appearance + wallpaper", Icons.Filled.Palette, onExportAppearance)
             Spacer(Modifier.height(8.dp)); ActionButton("Export settings only", Icons.Filled.Settings, onExportSettings)
             Spacer(Modifier.height(8.dp)); ActionButton("Import a preset", Icons.Filled.FolderOpen, onImport)
+        } }
+        item { CustomizeCard("Diagnostics", "LOCAL ONLY") {
+            Text("Crash reports stay on this device unless you choose to copy and share them.", color = Muted, fontSize = 12.sp)
+            Spacer(Modifier.height(10.dp)); ActionButton("View crash log", Icons.Filled.BugReport, onViewCrashLogs)
         } }
         item { Text("More controls are coming: typography, library layout, navigation, gestures, player controls, audio processing and per-screen modules.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 8.dp)) }
     }
@@ -313,7 +629,11 @@ private fun formatDuration(ms: Long): String = "%d:%02d".format(ms / 60000, (ms 
 private fun loadWallpaper(path: String): android.graphics.Bitmap? = runCatching {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(path, bounds)
+    require(bounds.outWidth in 1..30_000 && bounds.outHeight in 1..30_000) { "Wallpaper image is unavailable" }
+    require(bounds.outWidth.toLong() * bounds.outHeight <= 500_000_000L) { "Wallpaper dimensions are too large" }
     var sample = 1
-    while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048) sample *= 2
+    while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048 ||
+        (bounds.outWidth.toLong() / sample) * (bounds.outHeight.toLong() / sample) > 4_000_000L
+    ) sample *= 2
     BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
 }.getOrNull()

@@ -25,4 +25,17 @@ jobs:
       - name: Install Android platform
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Test and build debug APK
-        run: gradle testDebugUnitTest assembleDebug
+        shell: bash
+        run: |
+          set +e
+          gradle testDebugUnitTest assembleDebug --stacktrace > build-output.log 2>&1
+          result=$?
+          if [ "$result" -ne 0 ]; then
+            echo 'Gradle diagnostic summary:'
+            while IFS= read -r line; do echo "::error title=Gradle diagnostic::$line"; done < <(grep -Ei '(^e: |error:|What went wrong:|Execution failed for task|Could not |Caused by:|FAILURE:|Unresolved reference|Type mismatch|Overload resolution ambiguity|Expecting |failed|exception|denied|timed out)' build-output.log | tail -n 80)
+            echo 'Gradle output tail:'
+            tail -n 20 build-output.log
+          else
+            tail -n 25 build-output.log
+          fi
+          exit "$result"
