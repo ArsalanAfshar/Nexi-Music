@@ -25,4 +25,14 @@ jobs:
       - name: Install Android platform
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Test and build debug APK
-        run: gradle testDebugUnitTest assembleDebug
+        shell: bash
+        run: |
+          set +e
+          gradle testDebugUnitTest assembleDebug --stacktrace > build-output.log 2>&1
+          result=$?
+          if [ "$result" -ne 0 ]; then
+            while IFS= read -r line; do echo "::error::$line"; done < <(tail -n 80 build-output.log)
+          else
+            tail -n 25 build-output.log
+          fi
+          exit "$result"
